@@ -107,10 +107,109 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 
+# ─── Funciones de Limpieza de Nombres ──────────────────────────────────────
+
+import re
+
+def clean_company_name(raw_name: str) -> list[str]:
+    """
+    Limpia el nombre de empresa quitando sufijos internos y razones sociales.
+    Retorna una lista de variantes a intentar (de más específico a más general).
+    
+    Ejemplo:
+        "ABT Manufacturing Services SA de CV - IPM"
+        → ["ABT Manufacturing Services", "ABT Manufacturing"]
+    """
+    name = raw_name.strip()
+    
+    # Paso 1: Quitar sufijos internos como "- IPM", "- GAH", "- FLO", etc.
+    name = re.sub(r'\s*-\s*[A-Z]{2,5}\s*$', '', name)
+    
+    # Paso 2: Quitar razones sociales mexicanas y variantes comunes
+    legal_suffixes = [
+        r',?\s*S\.?\s*A\.?\s*S\.?\s*de\s*C\.?\s*V\.?',
+        r',?\s*S\.?\s*A\.?\s*de\s*C\.?\s*V\.?',
+        r',?\s*S\.?\s*de\s*R\.?\s*L\.?\s*de\s*C\.?\s*V\.?',
+        r',?\s*S\.?\s*A\.?\s*P\.?\s*I\.?\s*de\s*C\.?\s*V\.?',
+        r',?\s*S\.?\s*C\.?\s*de\s*R\.?\s*L\.?',
+        r',?\s*S\.?\s*A\.?\s*B\.?\s*de\s*C\.?\s*V\.?',
+        r',?\s*S\.?\s*A\.?',
+        r',?\s*S\.?\s*de\s*R\.?\s*L\.?',
+        r',?\s*Inc\.?',
+        r',?\s*LLC\.?',
+        r',?\s*Ltd\.?',
+        r',?\s*Corp\.?',
+        r',?\s*Co\.?',
+        r',?\s*GmbH',
+        r',?\s*SAS',
+        r',?\s*S\.?L\.?',
+    ]
+    
+    cleaned = name
+    for suffix in legal_suffixes:
+        cleaned = re.sub(suffix, '', cleaned, flags=re.IGNORECASE)
+    
+    cleaned = cleaned.strip(' ,.-')
+    
+    # Generar variantes para búsqueda
+    variants = []
+    
+    # Variante 1: nombre limpio completo
+    if cleaned and cleaned != raw_name.strip():
+        variants.append(cleaned)
+    
+    # Variante 2: solo las primeras 2-3 palabras (el "core" del nombre)
+    words = cleaned.split()
+    if len(words) > 2:
+        variants.append(" ".join(words[:3]))  # primeras 3 palabras
+    if len(words) > 3:
+        variants.append(" ".join(words[:2]))  # primeras 2 palabras
+    
+    # Si no se limpió nada, usar el original
+    if not variants:
+        variants.append(raw_name.strip())
+    
+    return variants
+
+
 # ─── Funciones de Apollo API ───────────────────────────────────────────────
 
+def _parse_org_result(org: dict, source_id: str = "") -> dict:
+    """Parsea un resultado de organización de Apollo a formato estándar."""
+    return {
+        "status": "found",
+        "name": org.get("name", ""),
+        "domain": org.get("primary_domain", org.get("domain", "N/A")),
+        "industry": org.get("industry", "N/A"),
+        "sub_industry": org.get("subindustry", "N/A"),
+        "keywords": ", ".join(org.get("keywords", [])[:5]) if org.get("keywords") else "N/A",
+        "employees": org.get("estimated_num_employees", "N/A"),
+        "revenue": org.get("annual_revenue_printed", "N/A"),
+        "city": org.get("city", "N/A"),
+        "state": org.get("state", "N/A"),
+        "country": org.get("country", "N/A"),
+        "phone": org.get("phone", "N/A"),
+        "linkedin_url": org.get("linkedin_url", "N/A"),
+        "founded_year": org.get("founded_year", "N/A"),
+        "technologies": ", ".join(org.get("technology_names", [])[:8]) if org.get("technology_names") else "N/A",
+        "raw": org,
+    }
+
+
+def _handle_error(resp_status: int, identifier: str) -> dict:
+    """Maneja errores HTTP comunes de Apollo."""
+    if resp_status == 401:
+        return {"status": "error", "error": "API Key inválida"}
+    elif resp_status == 403:
+        return {"status": "error", "error": "Acceso denegado (403) - este endpoint puede requerir plan de pago"}
+    elif resp_status == 429:
+        return {"status": "rate_limit", "error": "Rate limit alcanzado, espera un momento"}
+    else:
+        return {"status": "error", "error": f"HTTP {resp_status}"}
+
+
 def enrich_organization(domain: str, api_key: str) -> dict:
-    """Enriquece una organización usando el dominio."""
+    """Enriquece una organización usando el dominio (GET - funciona en plan gratuito)."""
     url = "https://api.apollo.io/api/v1/organizations/enrich"
     headers = {
         "Content-Type": "application/json",
@@ -123,42 +222,72 @@ def enrich_organization(domain: str, api_key: str) -> dict:
         resp = requests.get(url, headers=headers, params=params, timeout=15)
         if resp.status_code == 200:
             data = resp.json()
-            org = data.get("organization", {})
+            org = data.get("organization")
             if org:
-                return {
-                    "status": "found",
-                    "name": org.get("name", ""),
-                    "domain": org.get("primary_domain", domain),
-                    "industry": org.get("industry", "N/A"),
-                    "sub_industry": org.get("subindustry", "N/A"),
-                    "keywords": ", ".join(org.get("keywords", [])[:5]),
-                    "employees": org.get("estimated_num_employees", "N/A"),
-                    "revenue": org.get("annual_revenue_printed", "N/A"),
-                    "city": org.get("city", "N/A"),
-                    "state": org.get("state", "N/A"),
-                    "country": org.get("country", "N/A"),
-                    "phone": org.get("phone", "N/A"),
-                    "linkedin_url": org.get("linkedin_url", "N/A"),
-                    "founded_year": org.get("founded_year", "N/A"),
-                    "technologies": ", ".join(org.get("technology_names", [])[:8]),
-                    "raw": org,
-                }
+                return _parse_org_result(org)
             else:
                 return {"status": "not_found", "domain": domain}
-        elif resp.status_code == 401:
-            return {"status": "error", "domain": domain, "error": "API Key inválida"}
-        elif resp.status_code == 429:
-            return {"status": "rate_limit", "domain": domain, "error": "Límite de requests alcanzado, espera un momento"}
         else:
-            return {"status": "error", "domain": domain, "error": f"HTTP {resp.status_code}"}
+            return _handle_error(resp.status_code, domain)
     except requests.exceptions.Timeout:
-        return {"status": "error", "domain": domain, "error": "Timeout - el servidor tardó demasiado"}
+        return {"status": "error", "error": "Timeout"}
     except Exception as e:
-        return {"status": "error", "domain": domain, "error": str(e)}
+        return {"status": "error", "error": str(e)}
 
 
 def search_organization(name: str, api_key: str) -> dict:
-    """Busca una organización por nombre."""
+    """
+    Busca una organización por nombre usando el endpoint organizations/search.
+    Intenta múltiples variantes del nombre limpio.
+    """
+    # Generar variantes limpias del nombre
+    name_variants = clean_company_name(name)
+    
+    url = "https://api.apollo.io/api/v1/organizations/search"
+    headers = {
+        "Content-Type": "application/json",
+        "Cache-Control": "no-cache",
+        "x-api-key": api_key,
+    }
+    
+    for variant in name_variants:
+        payload = {
+            "q_organization_name": variant,
+            "page": 1,
+            "per_page": 3,  # traer 3 para elegir el mejor match
+        }
+        
+        try:
+            resp = requests.post(url, headers=headers, json=payload, timeout=15)
+            
+            if resp.status_code == 200:
+                data = resp.json()
+                organizations = data.get("organizations", [])
+                
+                if organizations:
+                    # Intentar encontrar el mejor match
+                    best = _pick_best_match(organizations, name)
+                    return _parse_org_result(best)
+                
+                # Si no hay resultados con esta variante, probar la siguiente
+                continue
+                
+            elif resp.status_code == 403:
+                # Si organizations/search da 403, intentar con mixed_companies
+                return _search_mixed_companies(variant, api_key)
+            else:
+                return _handle_error(resp.status_code, name)
+                
+        except requests.exceptions.Timeout:
+            return {"status": "error", "error": "Timeout"}
+        except Exception as e:
+            return {"status": "error", "error": str(e)}
+    
+    return {"status": "not_found", "name": name}
+
+
+def _search_mixed_companies(name: str, api_key: str) -> dict:
+    """Fallback: busca usando mixed_companies/search."""
     url = "https://api.apollo.io/api/v1/mixed_companies/search"
     headers = {
         "Content-Type": "application/json",
@@ -168,7 +297,7 @@ def search_organization(name: str, api_key: str) -> dict:
     payload = {
         "q_organization_name": name,
         "page": 1,
-        "per_page": 1,
+        "per_page": 3,
     }
     
     try:
@@ -177,35 +306,44 @@ def search_organization(name: str, api_key: str) -> dict:
             data = resp.json()
             accounts = data.get("accounts", [])
             if accounts:
-                org = accounts[0]
-                return {
-                    "status": "found",
-                    "name": org.get("name", ""),
-                    "domain": org.get("domain", "N/A"),
-                    "industry": org.get("industry", "N/A"),
-                    "sub_industry": org.get("subindustry", "N/A"),
-                    "keywords": ", ".join(org.get("keywords", [])[:5]) if org.get("keywords") else "N/A",
-                    "employees": org.get("estimated_num_employees", "N/A"),
-                    "revenue": org.get("annual_revenue_printed", "N/A"),
-                    "city": org.get("city", "N/A"),
-                    "state": org.get("state", "N/A"),
-                    "country": org.get("country", "N/A"),
-                    "phone": org.get("phone", "N/A"),
-                    "linkedin_url": org.get("linkedin_url", "N/A"),
-                    "founded_year": org.get("founded_year", "N/A"),
-                    "technologies": ", ".join(org.get("technology_names", [])[:8]) if org.get("technology_names") else "N/A",
-                    "raw": org,
-                }
-            else:
-                return {"status": "not_found", "name": name}
-        elif resp.status_code == 401:
-            return {"status": "error", "name": name, "error": "API Key inválida"}
-        elif resp.status_code == 429:
-            return {"status": "rate_limit", "name": name, "error": "Rate limit"}
+                best = _pick_best_match(accounts, name)
+                return _parse_org_result(best)
+            return {"status": "not_found", "name": name}
         else:
-            return {"status": "error", "name": name, "error": f"HTTP {resp.status_code}"}
+            return _handle_error(resp.status_code, name)
     except Exception as e:
-        return {"status": "error", "name": name, "error": str(e)}
+        return {"status": "error", "error": str(e)}
+
+
+def _pick_best_match(candidates: list, original_name: str) -> dict:
+    """
+    De una lista de resultados, elige el que mejor coincida con el nombre original.
+    Usa similaridad simple basada en palabras compartidas.
+    """
+    if len(candidates) == 1:
+        return candidates[0]
+    
+    original_words = set(original_name.lower().split())
+    
+    best_score = -1
+    best_candidate = candidates[0]
+    
+    for candidate in candidates:
+        candidate_name = candidate.get("name", "").lower()
+        candidate_words = set(candidate_name.split())
+        
+        # Contar palabras en común
+        common = len(original_words & candidate_words)
+        # Bonus si el nombre del candidato aparece dentro del original
+        bonus = 2 if candidate_name in original_name.lower() else 0
+        
+        score = common + bonus
+        
+        if score > best_score:
+            best_score = score
+            best_candidate = candidate
+    
+    return best_candidate
 
 
 def classify_telecom_fit(result: dict) -> str:
@@ -369,6 +507,19 @@ with st.sidebar:
     
     La app detectará las columnas automáticamente.
     """)
+    
+    st.divider()
+    st.markdown("### 🧹 Limpieza Automática")
+    st.markdown("""
+    La app limpia nombres antes de buscar:
+    - Quita sufijos internos: `- IPM`, `- GAH`
+    - Quita razones sociales: `S.A. de C.V.`, `S. de R.L.`, `Inc`, `LLC`
+    - Intenta variantes cortas si no encuentra match
+    
+    Ejemplo:
+    `ABT Manufacturing Services SA de CV - IPM`
+    → `ABT Manufacturing Services`
+    """)
 
 
 # ─── Contenido Principal ──────────────────────────────────────────────────
@@ -457,7 +608,11 @@ if uploaded_file:
                     if domain:
                         domain = domain.replace("https://", "").replace("http://", "").replace("www.", "").strip("/")
                     
-                    display_name = company_name or domain or f"Registro {i+1}"
+                    # Limpiar nombre de empresa
+                    cleaned_variants = clean_company_name(company_name) if company_name and company_name != "nan" else []
+                    cleaned_name = cleaned_variants[0] if cleaned_variants else company_name
+                    
+                    display_name = cleaned_name or domain or f"Registro {i+1}"
                     progress_bar.progress(pct, text=f"Buscando: {display_name} ({i+1}/{max_records})")
                     
                     # Hacer la búsqueda
@@ -465,7 +620,7 @@ if uploaded_file:
                     if use_domain and domain and domain != "nan":
                         result = enrich_organization(domain, api_key)
                     
-                    # Si no se encontró por dominio, intentar por nombre
+                    # Si no se encontró por dominio, intentar por nombre (ya limpio)
                     if (result is None or result.get("status") == "not_found") and company_name and company_name != "nan":
                         result = search_organization(company_name, api_key)
                     
@@ -475,6 +630,7 @@ if uploaded_file:
                     
                     # Agregar datos originales
                     result["original_company"] = company_name
+                    result["cleaned_name"] = cleaned_name
                     result["original_domain"] = domain
                     result["telecom_fit"] = classify_telecom_fit(result)
                     
@@ -577,6 +733,7 @@ if "results" in st.session_state and st.session_state["results"]:
             continue
         rows.append({
             "Cliente Original": r.get("original_company", ""),
+            "Nombre Limpio": r.get("cleaned_name", ""),
             "Dominio Original": r.get("original_domain", ""),
             "Status": "✅ Encontrado" if r.get("status") == "found" else "❌ No encontrado" if r.get("status") == "not_found" else f"⚠️ {r.get('error', 'Error')}",
             "Nombre en Apollo": r.get("name", ""),
